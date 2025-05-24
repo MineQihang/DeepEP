@@ -15,60 +15,113 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     # Settings
     num_tokens, hidden, num_topk_groups, num_topk, num_experts = 4096, 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
+
+    '''
+    num_tokens=4096     # (token数量)
+    hidden=7168         # (隐层大小)
+    num_topk_groups=4   # (token发给4台机器, Deepseek V3技术文档中提到为了减小通信,token只会发送到最多4台机器上)
+    num_topk = 8        # (发送给4台机器中的top 8专家)
+    num_experts=256     # (专家个数256)
+
+    num_sms=20          # (使用的streaming processor数量)
+    num_ranks=64        # (world size)
+    num_nodes=8         # (节点个数)
+
+    node=(当前节点是第几个节点 0-7)
+    local_rank=(当前主机第几块显卡, 由`torch.multiprocessing.spawn`的隐式入参决定, 0-7)
+    rank= node*8 + local_rank (当前显卡在64张显卡的位置)
+    '''
+
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
 
     # Random data
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    # ↓ 转换为FP8格式, x_e4m3 = ([4096, 7168] float8 e4m3, [4096, 56] float32)
     x_e4m3 = per_token_cast_to_fp8(x)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    # ↓ [4096, 8] score在每台机器上最大值
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
+    # ↓ [4096, 4] top4 group所对应的index （发送token去的top 4 机器）
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
+    # ↓ [4096, 256],  不在top4 group中的score被mask成0
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
+    # ↓ [4096, 8], top8 expert所对应的index （发送token去的top 8 专家）
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    # ↓ [4096, 8], top8 expert所对应的权重 
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    
+    # ↓ [4096, 8], 发送token去的expert所对应的rank, 等价是 topk_idx//4, [GPU idx / (每个GPU上多少个expert)]
     rank_idx = topk_idx // (num_experts // num_ranks)
+    # ↓ 按照请求频率排序这些节点, 以便进行后续的节点间通信. 如果某个显卡由多个expert, 则rank会重复，inplace_unique是去重了rank, 剩余位置补 -1
     rank_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rank_idx, num_ranks)
+    # ↑ rank_idx[4096, 8] top8 专家对应的去重rank
+
+    # ↓ [4096, 8] 去重rank_idx//8, 对应的第几台机器
     rdma_rank_idx = rank_idx // num_local_ranks
     rdma_rank_idx.masked_fill_(rank_idx == -1, -1)
     inplace_unique(rdma_rank_idx, num_nodes)
+    # ↑ 如果会发送同一台机器上的多个显卡上，则rdma_rank 会重复，inplace_unique去重了rdma_rank,剩余位置补 -1
 
     # RDMA dispatch counts
+    # ↓ [4096, 8], topk_idx//32, expert被分配到哪个机器
     rdma_idx = topk_idx // (num_experts // num_nodes)
     rdma_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rdma_idx, num_nodes)
     num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
+    # ↑ 总计需要发送的token数（累计全部token需要发送到多少台机器上）
+    # [DISCUSS] 我感觉rdma_rank_idx和rdma_idx是一样的，都是分配到哪个机器上了？
 
     # Expert meta
     num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
     for i in range(num_experts):
+        # ↓ 计算要发到每个expert的token数
         num_tokens_per_expert[i] = (topk_idx == i).sum()
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
+    # ↓ 计算整个world需要发送到各expert的token数
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
+    # [DISCUSS] 为啥要all_reduce? 是每个机器上都会有一个gate expert吗？
 
     # Rank layout meta
     num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
     num_tokens_per_rdma_rank = torch.empty((num_nodes, ), dtype=torch.int, device='cuda')
     token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
     for i in range(num_ranks):
+        # ↓ 计算发送到rank_i的token数
         num_tokens_per_rank[i] = (rank_idx == i).sum()
+        # ↓ [4096] 0-1, 0代表不发送到该rank, 1代表发送到该rank
         token_sel = (rank_idx == i).max(dim=-1)[0]
+        # ↓ 发送到rank_i的token数
         count = token_sel.sum().item()
+        # ↓ [4096] 排序的对应的token index, 排序的依据是token_sel的值（0-1）, 此时token index本身无序
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+        # ↓ [count] 基于token index排序, 从小到大排
         tokens[:count] = torch.sort(tokens[:count])[0]
+        # ↓ token_idx_in_rank[rank][token_index] = 发送给token_idx_in_rank[rank]第N个token(N 在 0 ~ count-1, 如果是-1则不发送给该rank)
         token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
     for i in range(num_nodes):
+        # ↓ 发送给第 rdma_rank 机器的token数量
         num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
+    # ↓ [4096, 64] contiguous保证数据连续
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
+    # ↓ [4096, 64] bool值， 发送到rank为1， 不发送为0
     is_token_in_rank = token_idx_in_rank >= 0
+    # ↓ [64] 计算整个world需要发送到各rank的token数
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
 
+    '''
+    上面为构建数据的过程
+    简单的来看，是可以通过score得到token要发送到哪里（expert, rank, rdma_rank）， 发送量有多少。 
+    而后通过这些信息，做下全局同步，就可以得到每个显卡会收到多少token, 来自哪里这些基础信息，方便后续分配显存接受数据和计算。
+    '''
+
     ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
+    # ↓ torch.allclose 判断两个tensor是否相等
     assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
     assert torch.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
     assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
@@ -218,6 +271,8 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
+    # ↓ 首先是通过torch.dist.init_process_group构建了通信组，这个通信组主要是维持全局信息。
+    # ↓ 从而得到当前显卡对应的rank值， world size(num_ranks=64), 以及用于表征通信组的group
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     test_ll_compatibility = True
     if test_ll_compatibility:
@@ -244,4 +299,5 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 if __name__ == '__main__':
     num_processes = 8
+    # ↓ args will become ([0/1/.../num_processes-1], num_processes) because of `torch.multiprocessing.spawn`
     torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)

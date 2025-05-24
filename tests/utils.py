@@ -35,10 +35,20 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
 
 
 def per_token_cast_to_fp8(x: torch.Tensor):
+    # 确保输入是二维张量，且第二维是128的倍数
     assert x.dim() == 2 and x.size(1) % 128 == 0
+    
+    # 获取张量形状
     m, n = x.shape
+    
+    # 将张量重新排列为 (batch_size, groups, 128) 形状
     x_view = x.view(m, -1, 128)
+    
+    # 计算每组128个值的最大绝对值，并设置最小值为1e-4
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    
+    # 计算缩放后的值并转换为FP8格式，再恢复原始形状
+    # 同时返回缩放因子（除以448用于反量化）
     return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, -1)
 
 
